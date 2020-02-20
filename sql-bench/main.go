@@ -29,21 +29,22 @@ import (
 )
 
 var (
+	truncate       = flag.Bool("t", false, "truncate tables, default: false")
 	concurrent     = flag.Int("c", 50, "concurrent workers, default: 50")
 	sqlCount       = flag.Int("sql-count", 0, "sql count, default read all data from file: 0")
 	maxTime        = flag.Int("max-time", 0, "exec max time, default: 0")
 	reportInterval = flag.Int("report-interval", 0, "report status interval, default: 0")
-	addr           = flag.String("addr", ":4000", "tidb-server addr, default: :4000")
-	dbName         = flag.String("db", "test", "db name, default: test")
+	addr           = flag.String("addr", "127.0.0.1:4000", "tidb-server addr, default: 127.0.0.1:4000")
+	dbName         = flag.String("db", "quangltp", "db name, default: quangltp")
 	user           = flag.String("u", "root", "username, default: root")
 	password       = flag.String("p", "", "password, default: empty")
-	logLevel       = flag.String("L", "error", "log level, default: error")
-	sqlFile        = flag.String("data", "./bench.sql", "SQL data file for bench")
+	logLevel       = flag.String("L", "info", "log level, default: info")
+	sqlFile        = flag.String("data", "", "SQL data file for bench")
+	sqlFiles       = flag.String("datas", "", "List of SQL data files for bench")
 )
 
 var (
-	statChan chan *stat
-	db       *sql.DB
+	db *sql.DB
 )
 
 const (
@@ -54,7 +55,6 @@ const (
 func init() {
 	flag.Parse()
 	log.SetLevelByString(*logLevel)
-	statChan = make(chan *stat, statChanSize)
 	var err error
 	db, err = sql.Open("mysql", fmt.Sprintf("%s:%s@tcp(%s)/%s", *user, *password, *addr, *dbName))
 	if err != nil {
@@ -62,9 +62,9 @@ func init() {
 	}
 }
 
-func readQuery(ctx context.Context, queryChan chan string) {
+func readQuery(ctx context.Context, fileName string, queryChan chan string) {
 	var querys []string
-	file, err := os.Open(*sqlFile)
+	file, err := os.Open(fileName)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -92,26 +92,26 @@ func readQuery(ctx context.Context, queryChan chan string) {
 	if err := scanner.Err(); err != nil {
 		log.Fatal(err)
 	}
-LOOP:
-	for cnt < *sqlCount {
-		for _, query := range querys {
-			cnt++
-			queryChan <- query
-			if cnt >= *sqlCount {
-				break LOOP
-			}
-			select {
-			case <-ctx.Done():
-				log.Infof("Get %d queries\n", cnt)
-				return
-			default:
-			}
-		}
-	}
+	//LOOP:
+	//	for cnt < *sqlCount {
+	//		for _, query := range querys {
+	//			cnt++
+	//			queryChan <- query
+	//			if cnt >= *sqlCount {
+	//				break LOOP
+	//			}
+	//			select {
+	//			case <-ctx.Done():
+	//				log.Infof("Get %d queries\n", cnt)
+	//				return
+	//			default:
+	//			}
+	//		}
+	//	}
 	log.Infof("Get %d queries\n", cnt)
 }
 
-func worker(ctx context.Context, id int, queryChan chan string, wg *sync.WaitGroup) {
+func worker(ctx context.Context, id int, queryChan chan string, statChan chan *stat, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
 		query, ok := <-queryChan
@@ -119,7 +119,7 @@ func worker(ctx context.Context, id int, queryChan chan string, wg *sync.WaitGro
 			// No more query
 			return
 		}
-		exec(query)
+		exec(query, statChan)
 		select {
 		case <-ctx.Done():
 			return
@@ -134,7 +134,7 @@ type stat struct {
 	succ  bool
 }
 
-func exec(sqlStmt string) error {
+func exec(sqlStmt string, statChan chan *stat) error {
 	sql := strings.ToLower(sqlStmt)
 	isQuery := strings.HasPrefix(sql, "select")
 	// Get time
@@ -162,7 +162,7 @@ func runQuery(sqlStmt string, isQuery bool) error {
 	return err
 }
 
-func statWorker(wg *sync.WaitGroup, startTs time.Time) {
+func statWorker(wg *sync.WaitGroup, statChan chan *stat, startTs time.Time) {
 	defer wg.Done()
 	var (
 		total       int64
@@ -201,9 +201,23 @@ func statWorker(wg *sync.WaitGroup, startTs time.Time) {
 }
 
 func main() {
+	files := make([]string, 0)
+	if len(*sqlFile) != 0 {
+		files = append(files, *sqlFile)
+	}
+	if len(*sqlFiles) != 0 {
+		files = append(files, strings.Split(*sqlFiles, ",")...)
+	}
+	for _, f := range files {
+		doBench(f)
+	}
+}
+
+func doBench(file string) {
 	// Start
-	log.Info("Start Bench")
+	log.Infof("Start Bench with %s", file)
 	queryChan := make(chan string, queryChanSize)
+	statChan := make(chan *stat, statChanSize)
 	wg := sync.WaitGroup{}
 	wgStat := sync.WaitGroup{}
 	// Start N workers
@@ -211,15 +225,15 @@ func main() {
 	for i := 0; i < *concurrent; i++ {
 		wg.Add(1)
 		ctx, _ := context.WithTimeout(context.Background(), timeout)
-		go worker(ctx, i, queryChan, &wg)
+		go worker(ctx, i, queryChan, statChan, &wg)
 	}
 
 	wgStat.Add(1)
 	startTs := time.Now()
-	go statWorker(&wgStat, startTs)
+	go statWorker(&wgStat, statChan, startTs)
 
 	ctxR, _ := context.WithTimeout(context.Background(), timeout)
-	go readQuery(ctxR, queryChan)
+	go readQuery(ctxR, file, queryChan)
 	wg.Wait()
 	close(statChan)
 	wgStat.Wait()
